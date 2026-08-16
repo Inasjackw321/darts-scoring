@@ -59,10 +59,18 @@ def find_chromium() -> str | None:
 
 
 def post(path: str, payload: dict) -> dict:
+    import ssl
+
     request = urllib.request.Request(
         BASE + path, data=json.dumps(payload).encode(), headers={"Content-Type": "application/json"}
     )
-    return json.loads(urllib.request.urlopen(request).read())
+    # The LAN certificate is self-signed by design, and a LAN address must
+    # never be routed through a configured HTTP proxy.
+    unverified = ssl._create_unverified_context()
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({}), urllib.request.HTTPSHandler(context=unverified)
+    )
+    return json.loads(opener.open(request).read())
 
 
 def main() -> int:
@@ -74,6 +82,7 @@ def main() -> int:
 
     launch_args = [
         "--no-sandbox",
+        "--no-proxy-server",
         "--use-fake-ui-for-media-stream",
         "--use-fake-device-for-media-stream",
         f"--use-file-for-fake-video-capture={video}",
@@ -82,7 +91,8 @@ def main() -> int:
 
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(executable_path=executable, args=launch_args)
-        context = browser.new_context(viewport={"width": 390, "height": 844}, permissions=["camera"])
+        context = browser.new_context(viewport={"width": 390, "height": 844}, permissions=["camera"],
+                                      ignore_https_errors=True)
         page = context.new_page()
         page.on("pageerror", lambda exc: errors.append(str(exc)))
 
