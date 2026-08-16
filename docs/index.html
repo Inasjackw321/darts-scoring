@@ -64,7 +64,9 @@
 
     <div class="panel">
       <div class="panel-head"><span>Camera</span><span class="muted" id="camera-status">off</span></div>
+      <p class="muted" id="camera-role">No camera running yet. Start one on the phone you have pointed at the board.</p>
       <video id="video" playsinline muted autoplay></video>
+      <img id="preview" class="preview hidden" alt="Live view from the camera device, with detected dart tips marked">
       <canvas id="capture-canvas" class="hidden"></canvas>
       <canvas id="motion-canvas" class="hidden"></canvas>
       <div class="row">

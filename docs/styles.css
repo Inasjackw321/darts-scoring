@@ -117,6 +117,13 @@ main { padding: 12px 12px calc(24px + env(safe-area-inset-bottom)); max-width: 7
 .btn-danger { background: #43231f; border-color: var(--danger); }
 
 /* ---------- media ---------- */
+.preview {
+  width: 100%;
+  border-radius: 10px;
+  background: #000;
+  display: block;
+}
+
 video, .calib-stage canvas {
   width: 100%;
   border-radius: 10px;

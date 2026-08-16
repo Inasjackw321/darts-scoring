@@ -46,6 +46,26 @@ works. With it:
 ollama pull llama3.2-vision
 ```
 
+## Two screens, one game
+
+There is only ever **one game**. It lives on the desktop server; every browser
+window is a view of it. What differs is the role each device plays:
+
+- **The phone is the camera.** Mounted, facing the board, camera running. The
+  first device to send a frame claims the camera role.
+- **Any other screen is a scoreboard.** Its *Start camera* button greys out to
+  "Camera on another device", and in place of its own (empty) video it shows
+  the phone's live view — annotated with the calibrated board outline and a red
+  circle on each detected dart tip. A desktop monitor makes a far better
+  scoreboard than a phone propped across the room.
+
+That live view is the fastest way to diagnose a misread: if the outline does
+not sit on the outer wire, recalibrate; if the circles are on the flights
+rather than the points, the camera is behind the board rather than in front.
+
+The camera role is released after 15 seconds of silence, so if the phone dies
+mid-game another device can simply start its camera and take over.
+
 ## Using it
 
 **Calibrate once** (and again if the camera is bumped):
@@ -110,6 +130,7 @@ frame, a bumped camera changes 30%+.
 | `POST /reset` | New game, clears the reference frame |
 | `POST /turn/next` | Bank the turn, re-take the reference |
 | `POST /dart`, `PATCH /dart`, `POST /dart/undo` | Manual add / correct / undo |
+| `GET /preview.jpg` | Newest annotated camera frame, for scoreboard-only screens |
 | `GET /board` | Board geometry constants |
 
 Interactive docs at `https://<desktop>:8000/docs`.
@@ -130,7 +151,7 @@ without the desktop running.
 
 ```bash
 python -m venv .venv && .venv/bin/pip install -r requirements.txt
-.venv/bin/python -m pytest tests/ -q          # 103 tests, no hardware needed
+.venv/bin/python -m pytest tests/ -q          # 109 tests, no hardware needed
 .venv/bin/python -m uvicorn app.main:app --reload --port 8000
 ```
 
