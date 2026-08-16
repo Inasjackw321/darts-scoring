@@ -27,7 +27,8 @@
     players: ['Player 1'],
     motionThreshold: 0.15, // percent of pixels that must change; a single
                            // landed dart measures ~0.2-0.5%, camera noise ~0.0%
-    cooldownMs: 1500
+    cooldownMs: 1500,
+    videoSource: ''
   };
 
   function normaliseUrl(url) {
@@ -113,7 +114,12 @@
     nextTurn: function (payload) { return this.request('/turn/next', { method: 'POST', body: payload || {} }); },
     addDart: function (payload) { return this.request('/dart', { method: 'POST', body: payload }); },
     editDart: function (payload) { return this.request('/dart', { method: 'PATCH', body: payload }); },
-    undoDart: function () { return this.request('/dart/undo', { method: 'POST', body: {} }); }
+    undoDart: function () { return this.request('/dart/undo', { method: 'POST', body: {} }); },
+    startCapture: function (source) {
+      // Opening a stream can take a few seconds before it reports back.
+      return this.request('/capture/start', { method: 'POST', body: { source: source }, timeoutMs: 20000 });
+    },
+    stopCapture: function () { return this.request('/capture/stop', { method: 'POST', body: {} }); }
   };
 
   /* Exponential backoff around any promise-returning call, so a phone that

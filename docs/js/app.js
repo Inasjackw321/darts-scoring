@@ -120,17 +120,23 @@
     var info = (status && status.camera) || {};
     var mine = camera.isRunning();
     var elsewhere = info.active && info.client_id && info.client_id !== Api.clientId;
-    state.cameraElsewhere = !!elsewhere;
+    var server = !!(status && status.capture && status.capture.connected);
+    state.cameraElsewhere = !!(elsewhere || server);
 
     var role = $('camera-role');
     var button = $('btn-start-camera');
     $('video').classList.toggle('hidden', !mine);
-    $('preview').classList.toggle('hidden', mine || !elsewhere);
+    $('preview').classList.toggle('hidden', mine || !(elsewhere || server));
 
     if (mine) {
       role.textContent = 'This device is the camera. Keep it still and pointed at the board.';
       button.disabled = false;
       button.textContent = 'Stop camera';
+    } else if (server) {
+      role.textContent = 'The desktop is reading the camera directly. This screen is a scoreboard — ' +
+        'the live view below is what the camera sees, with detected tips circled.';
+      button.disabled = true;
+      button.textContent = 'Desktop is the camera';
     } else if (elsewhere) {
       role.textContent = 'Camera is running on another device — this is the scoreboard. ' +
         'Detected tips are circled in the live view below.';
@@ -141,6 +147,25 @@
       button.disabled = false;
       button.textContent = 'Start camera';
     }
+  }
+
+  function renderCapture(status) {
+    var info = (status && status.capture) || {};
+    var label = $('capture-state');
+    var detail = $('capture-detail');
+    if (!info.running) {
+      label.textContent = 'off';
+      detail.textContent = info.error || 'Not running.';
+      return;
+    }
+    if (!info.connected) {
+      label.textContent = 'connecting';
+      detail.textContent = info.error || 'Opening ' + info.source + '…';
+      return;
+    }
+    label.textContent = 'live';
+    detail.textContent = 'Reading ' + info.source + ' · ' + info.frames_read +
+      ' frames · last motion ' + info.last_motion_pct + '%';
   }
 
   /* Poll the shared frame only while it is actually on screen. */
@@ -156,6 +181,7 @@
     return Api.status().then(function (status) {
       setConnection(status.needs_recalibration ? 'warn' : 'ok');
       renderCameraRole(status);
+      renderCapture(status);
       state.calibrated = status.calibrated;
       renderGame(status.game);
       $('status-dump').textContent = JSON.stringify(status, null, 2);
@@ -310,6 +336,7 @@
     $('players').value = settings.players.join('\n');
     $('motion-threshold').value = settings.motionThreshold;
     $('cooldown-ms').value = settings.cooldownMs;
+    $('video-source').value = settings.videoSource || '';
   }
 
   function saveSettingsFromForm() {
@@ -317,8 +344,9 @@
       mode: $('game-mode').value,
       startScore: Number($('start-score').value) || 501,
       players: $('players').value.split('\n').map(function (s) { return s.trim(); }).filter(Boolean),
-      motionThreshold: Number($('motion-threshold').value) || 2,
-      cooldownMs: Number($('cooldown-ms').value) || 0
+      motionThreshold: Number($('motion-threshold').value) || 0.15,
+      cooldownMs: Number($('cooldown-ms').value) || 0,
+      videoSource: $('video-source').value.trim()
     });
     showBanner('Settings saved.', 'info', 'settings');
   }
@@ -408,6 +436,35 @@
     });
     $('btn-test').addEventListener('click', function () { refreshStatus().catch(function () {}); });
     $('btn-save-settings').addEventListener('click', saveSettingsFromForm);
+
+    $('btn-capture-start').addEventListener('click', function () {
+      var source = $('video-source').value.trim();
+      if (!source) {
+        showBanner('Enter the stream URL from your phone\'s webcam app, or 0 for a USB camera.', 'warn');
+        return;
+      }
+      state.settings.videoSource = source;
+      Api.saveSettings(state.settings);
+      $('capture-detail').textContent = 'Opening ' + source + '…';
+      Api.startCapture(source).then(function (result) {
+        renderCapture({ capture: result.capture });
+        if (result.ok) {
+          showBanner('Camera connected. The desktop is now doing the capturing.', 'info', 'capture');
+        } else {
+          showBanner('Could not open ' + source + '. ' + (result.capture.error || '') +
+            ' Check the app is streaming and the address is right.', 'error', 'capture');
+        }
+        return refreshStatus();
+      }).catch(function (err) { showBanner(err.message, 'error', 'capture'); });
+    });
+
+    $('btn-capture-stop').addEventListener('click', function () {
+      Api.stopCapture().then(function (result) {
+        renderCapture({ capture: result.capture });
+        showBanner('Capture stopped.', 'info', 'capture');
+        return refreshStatus();
+      }).catch(function (err) { showBanner(err.message, 'error', 'capture'); });
+    });
 
     $('btn-freeze').addEventListener('click', function () {
       var take = camera.isRunning() ? Promise.resolve() : camera.start().then(function () {

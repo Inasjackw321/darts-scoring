@@ -23,7 +23,7 @@ from fastapi.responses import RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import board, calibration as calib, config, debug_log, detection, ollama_client
+from . import board, calibration as calib, capture as capture_mod, config, debug_log, detection, ollama_client
 from .game import GAME_MODES, MODE_COUNT_UP, GameState
 
 APP_VERSION = "0.2.0"
@@ -37,9 +37,21 @@ FRONTEND_DIR = config.BASE_DIR / "docs"
 async def lifespan(_: FastAPI):
     config.ensure_dirs()
     print(f"\n  AI Vision Dart Scorer v{APP_VERSION}")
-    print(f"  Phone should connect to:  http://{lan_ip()}:8000")
-    print(f"  Calibrated: {state.calibration is not None}\n")
-    yield
+    print(f"  Scoreboard:  http://{lan_ip()}:8000")
+    print(f"  Calibrated: {state.calibration is not None}")
+    if config.VIDEO_SOURCE and config.CAPTURE_AUTOSTART:
+        worker = capture_mod.CaptureWorker(capture_mod.parse_source(config.VIDEO_SOURCE), score_frame)
+        state.capture = worker
+        worker.start()
+        print(f"  Capturing from: {config.VIDEO_SOURCE}")
+    else:
+        print("  No video source set — set DARTS_VIDEO_SOURCE or start one from Settings")
+    print()
+    try:
+        yield
+    finally:
+        if state.capture:
+            state.capture.stop()
 
 
 app = FastAPI(title="AI Vision Dart Scorer", version=APP_VERSION, lifespan=lifespan)
@@ -77,6 +89,9 @@ class ServerState:
         # role; others show the preview instead of competing for the board.
         self.camera_client: Optional[str] = None
         self.camera_seen_at: float = 0.0
+        # Server-side capture worker, when the desktop reads a camera itself
+        # rather than waiting for a browser to post frames.
+        self.capture: Optional["capture_mod.CaptureWorker"] = None
 
     def camera_status(self, now: Optional[float] = None) -> dict:
         now = now or time.time()
@@ -135,6 +150,13 @@ class ResetRequest(BaseModel):
     players: Optional[list[str]] = None
     start_score: int = 501
     image: Optional[str] = Field(None, description="Fresh clear-board frame to use as the new reference")
+
+
+class CaptureRequest(BaseModel):
+    source: Optional[str] = Field(
+        None,
+        description="Device index ('0') or stream URL (e.g. http://192.168.1.30:8080/video). Omit to reuse the configured source.",
+    )
 
 
 class ManualDartRequest(BaseModel):
@@ -238,6 +260,7 @@ def get_status() -> dict:
             "needs_recalibration": state.needs_recalibration,
             "frames_processed": state.frames_processed,
             "camera": state.camera_status(),
+            "capture": state.capture.status() if state.capture else {"running": False, "source": config.VIDEO_SOURCE},
             "ollama": {
                 "url": config.OLLAMA_URL,
                 "model": config.OLLAMA_MODEL,
@@ -313,14 +336,16 @@ def delete_calibration() -> dict:
     return {"calibrated": False}
 
 
-@app.post("/frame")
-def post_frame(request: FrameRequest) -> dict:
-    """Score a frame: detect tips, map to board space, tally new darts."""
-    frame = _decode(request.image)
+def score_frame(frame: np.ndarray, set_reference: bool = False, client_id: Optional[str] = None) -> dict:
+    """Score one frame. The single scoring implementation.
 
+    Both the HTTP endpoint (a phone browser posting frames) and the server-side
+    capture loop (a webcam or a phone stream read directly) come through here,
+    so the two routes can never drift apart.
+    """
     with state.lock:
-        state.claim_camera(request.client_id)
-        if request.set_reference or state.reference_gray is None:
+        state.claim_camera(client_id)
+        if set_reference or state.reference_gray is None:
             state.reference_gray = detection.to_gray(frame)
             state.reference_captured_at = time.time()
             _store_preview(frame, [])
@@ -333,7 +358,15 @@ def post_frame(request: FrameRequest) -> dict:
             }
 
         if state.calibration is None:
-            raise HTTPException(status_code=409, detail="not calibrated — run /calibrate first")
+            # Returned rather than raised: the capture loop is not an HTTP
+            # request and must be able to keep running while you calibrate.
+            return {
+                "status": "not_calibrated",
+                "new_darts": [],
+                "tips": [],
+                "game": state.game.to_dict(),
+                "warnings": ["Not calibrated yet — open the Calibrate tab"],
+            }
 
         reference = state.reference_gray
         tips, mask = detection.detect_tips(reference, frame, state.calibration)
@@ -410,6 +443,16 @@ def post_frame(request: FrameRequest) -> dict:
             "game": game_payload,
             "warnings": warnings,
         }
+
+
+@app.post("/frame")
+def post_frame(request: FrameRequest) -> dict:
+    """Score a frame posted by a phone browser acting as the camera."""
+    frame = _decode(request.image)
+    result = score_frame(frame, set_reference=request.set_reference, client_id=request.client_id)
+    if result["status"] == "not_calibrated":
+        raise HTTPException(status_code=409, detail="not calibrated — run /calibrate first")
+    return result
 
 
 @app.post("/verify")
@@ -509,6 +552,43 @@ def post_undo() -> dict:
         if dart is None:
             raise HTTPException(status_code=409, detail="no darts to undo in the current turn")
         return {"ok": True, "removed": dart.to_dict(), "game": state.game.to_dict()}
+
+
+@app.post("/capture/start")
+def post_capture_start(request: CaptureRequest = CaptureRequest()) -> dict:
+    """Start reading a camera on the desktop (phone stream, USB, virtual cam)."""
+    source = (request.source or config.VIDEO_SOURCE).strip()
+    if not source:
+        raise HTTPException(
+            status_code=400,
+            detail="no video source set — provide one, e.g. http://<phone-ip>:8080/video or 0 for a USB camera",
+        )
+
+    with state.lock:
+        if state.capture and state.capture.is_running():
+            state.capture.stop()
+        worker = capture_mod.CaptureWorker(capture_mod.parse_source(source), score_frame)
+        state.capture = worker
+    worker.start()
+
+    # Report a source that cannot be opened rather than sitting on a silent
+    # retry loop the user has no way to see.
+    deadline = time.time() + 4.0
+    while time.time() < deadline and worker.is_running() and not worker.connected and not worker.error:
+        time.sleep(0.1)
+    status = worker.status()
+    debug_log.log_event("capture_start", status)
+    return {"ok": bool(status["connected"]), "capture": status}
+
+
+@app.post("/capture/stop")
+def post_capture_stop() -> dict:
+    with state.lock:
+        worker = state.capture
+    if worker is None or not worker.is_running():
+        return {"ok": True, "capture": {"running": False}}
+    worker.stop()
+    return {"ok": True, "capture": worker.status()}
 
 
 @app.get("/game")

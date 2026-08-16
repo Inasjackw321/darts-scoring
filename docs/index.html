@@ -118,6 +118,23 @@
     </div>
 
     <div class="panel">
+      <div class="panel-head"><span>Camera source</span><span class="muted" id="capture-state">off</span></div>
+      <p class="help">
+        Let the desktop read the camera itself — a webcam app on your phone, or a USB
+        camera. Then no browser needs camera access at all.
+      </p>
+      <label class="field">
+        <span>Stream URL, or <code>0</code> for a USB / virtual webcam</span>
+        <input id="video-source" type="text" inputmode="url" placeholder="http://192.168.1.30:8080/video" autocomplete="off">
+      </label>
+      <div class="controls">
+        <button id="btn-capture-start" class="btn btn-primary">Start capture</button>
+        <button id="btn-capture-stop" class="btn">Stop capture</button>
+      </div>
+      <p class="muted" id="capture-detail">Not running.</p>
+    </div>
+
+    <div class="panel">
       <label class="field">
         <span>Game mode</span>
         <select id="game-mode">

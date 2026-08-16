@@ -45,6 +45,23 @@ BOUNDARY_WARN_MM = float(os.environ.get("DARTS_BOUNDARY_WARN_MM", "3"))
 # frame, while a bumped camera changes 30%+, so there is a lot of room here.
 CAMERA_MOVED_FRACTION = float(os.environ.get("DARTS_CAMERA_MOVED_FRACTION", "0.25"))
 
+# --- Server-side capture --------------------------------------------------
+# Where the desktop reads video from. A bare number is a local device index
+# ("0" = first USB/virtual webcam); anything else is a URL or file path, e.g.
+# an iPhone running IP Camera Lite: http://192.168.1.30:8080/video
+VIDEO_SOURCE = os.environ.get("DARTS_VIDEO_SOURCE", "").strip()
+CAPTURE_AUTOSTART = os.environ.get("DARTS_CAPTURE_AUTOSTART", "1") not in ("0", "false", "False")
+# Fraction of the frame that must change to be worth scoring. One dart is
+# roughly 0.2-0.5%; sensor noise sits near zero.
+CAPTURE_MOTION_FRACTION = float(os.environ.get("DARTS_CAPTURE_MOTION_FRACTION", "0.0015"))
+# Wait this long after motion before grabbing the frame to score, so the dart
+# has stopped wobbling and the throwing arm has left the shot.
+CAPTURE_SETTLE_S = float(os.environ.get("DARTS_CAPTURE_SETTLE_S", "0.45"))
+# After a dart is scored, ignore motion for this long.
+CAPTURE_COOLDOWN_S = float(os.environ.get("DARTS_CAPTURE_COOLDOWN_S", "1.5"))
+# Polling pause when nothing is happening, to keep the loop off a busy spin.
+CAPTURE_IDLE_SLEEP_S = float(os.environ.get("DARTS_CAPTURE_IDLE_SLEEP_S", "0.05"))
+
 DEBUG_LOGGING = os.environ.get("DARTS_DEBUG_LOG", "1") not in ("0", "false", "False")
 MAX_DEBUG_FRAMES = int(os.environ.get("DARTS_MAX_DEBUG_FRAMES", "300"))
 
