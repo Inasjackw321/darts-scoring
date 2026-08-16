@@ -69,21 +69,42 @@ for /f "tokens=2 delims=:" %%A in ('ipconfig ^| findstr /c:"IPv4 Address"') do (
 set "LANIP=!LANIP: =!"
 if "!LANIP!"=="" set "LANIP=127.0.0.1"
 
+REM ---- 6. HTTPS certificate --------------------------------------------
+REM Phones only allow camera access on HTTPS (or localhost). Over plain
+REM http://192.168.x.x the browser hides the camera API entirely, so the app
+REM cannot start. A self-signed certificate for this machine fixes that.
+echo [setup] Checking HTTPS certificate for !LANIP!...
+python -m app.certs !LANIP! 127.0.0.1 >nul
+if errorlevel 1 (
+    echo [warn] Could not create a certificate - falling back to HTTP.
+    echo        The desktop browser will still work; the phone camera will not.
+    set "SSLARGS="
+) else (
+    set "SSLARGS=--ssl-certfile data\lan-cert.pem --ssl-keyfile data\lan-key.pem"
+    set "SCHEME=https"
+)
+if "!SSLARGS!"=="" set "SCHEME=http"
+
 echo.
 echo ============================================
 echo   Open this on your phone:
-echo       http://!LANIP!:8000
-echo   (or enter that address in the app's Settings tab)
+echo       !SCHEME!://!LANIP!:8000
 echo ============================================
 echo.
+if "!SCHEME!"=="https" (
+    echo   Your phone will warn that the certificate is not trusted.
+    echo   That is expected - it is your own PC. Tap Advanced, then
+    echo   "Proceed" / "Visit this website". You do this once per device.
+    echo.
+)
 echo   Windows Firewall may ask to allow Python on the first run.
 echo   Tick "Private networks" or the phone will not be able to connect.
 echo.
 
-start "" http://localhost:8000/
+start "" !SCHEME!://localhost:8000/
 
-REM ---- 6. Server -------------------------------------------------------
-python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
+REM ---- 7. Server -------------------------------------------------------
+python -m uvicorn app.main:app --host 0.0.0.0 --port 8000 !SSLARGS!
 goto :eof
 
 :fail

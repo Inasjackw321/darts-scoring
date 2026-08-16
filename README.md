@@ -28,9 +28,16 @@ surfaced as a warning rather than silently overriding the score.
 2. **Windows Firewall will prompt on the first run.** Tick *Private networks*
    and allow it, or your phone cannot reach the server.
 3. On your phone (same Wi-Fi), open the address `start.bat` printed, e.g.
-   `http://192.168.1.20:8000`.
-4. In the browser menu choose **Add to Home Screen** — it installs as a PWA and
-   opens fullscreen from an icon.
+   `https://192.168.1.20:8000`. Your phone will warn that the certificate is
+   untrusted — it is your own PC, self-signing. Tap *Advanced → Proceed*, once
+   per device.
+4. In the browser menu choose **Add to Home Screen** for a tap-to-launch icon.
+
+**Why HTTPS?** Browsers only expose the camera in a "secure context" — HTTPS or
+localhost. Over plain `http://192.168.x.x` the camera API is not merely blocked,
+it is absent, so the app cannot start at all. `start.bat` therefore generates a
+self-signed certificate for your LAN address (`data/lan-cert.pem`) and serves
+over HTTPS. It regenerates automatically if your router hands out a new IP.
 
 Ollama is optional. Without it, everything except the *Verify (AI)* button
 works. With it:
@@ -38,6 +45,26 @@ works. With it:
 ```
 ollama pull llama3.2-vision
 ```
+
+## Two screens, one game
+
+There is only ever **one game**. It lives on the desktop server; every browser
+window is a view of it. What differs is the role each device plays:
+
+- **The phone is the camera.** Mounted, facing the board, camera running. The
+  first device to send a frame claims the camera role.
+- **Any other screen is a scoreboard.** Its *Start camera* button greys out to
+  "Camera on another device", and in place of its own (empty) video it shows
+  the phone's live view — annotated with the calibrated board outline and a red
+  circle on each detected dart tip. A desktop monitor makes a far better
+  scoreboard than a phone propped across the room.
+
+That live view is the fastest way to diagnose a misread: if the outline does
+not sit on the outer wire, recalibrate; if the circles are on the flights
+rather than the points, the camera is behind the board rather than in front.
+
+The camera role is released after 15 seconds of silence, so if the phone dies
+mid-game another device can simply start its camera and take over.
 
 ## Using it
 
@@ -58,8 +85,9 @@ Calibration persists in `data/calibration.json` until the camera moves.
 - **Start camera** — the first frame is stored as the clear-board reference.
 - Throw. Motion detection on the phone fires a capture, the server scores it,
   the dart appears on the scoreboard and the board diagram.
-- **Next turn** — bank the turn, then pull your darts out. This re-takes the
-  reference frame, so do it *after* the board is clear.
+- **Pull your darts out, then tap Next turn** — in that order. Next turn banks
+  the turn and re-takes the clear-board reference from what the camera can see
+  at that moment, so the board must already be empty when you tap it.
 - **Tap any dart** in the turn to correct it. **Undo dart** removes the last
   one. Bounce-outs and darts the camera could not see go in with **Add
   manually** — expect to need this occasionally; no hybrid pipeline is perfect.
@@ -85,6 +113,7 @@ The server reads environment variables — no code edits needed:
 | `DARTS_CAMERA_MOVED_FRACTION` | `0.25` | Frame change fraction that means "camera moved" |
 | `DARTS_ALLOWED_ORIGINS` | GitHub Pages + localhost | Extra CORS origins |
 | `DARTS_DEBUG_LOG` | `1` | Write frames/masks/results to `data/debug/` |
+| `DARTS_DATA_DIR` | `./data` | Where calibration, certificate and logs live |
 
 For scale on that last threshold: three darts change well under 1% of the
 frame, a bumped camera changes 30%+.
@@ -101,26 +130,28 @@ frame, a bumped camera changes 30%+.
 | `POST /reset` | New game, clears the reference frame |
 | `POST /turn/next` | Bank the turn, re-take the reference |
 | `POST /dart`, `PATCH /dart`, `POST /dart/undo` | Manual add / correct / undo |
+| `GET /preview.jpg` | Newest annotated camera frame, for scoreboard-only screens |
 | `GET /board` | Board geometry constants |
 
-Interactive docs at `http://<desktop>:8000/docs`.
+Interactive docs at `https://<desktop>:8000/docs`.
 
 ## Frontend on GitHub Pages
 
-`docs/` is a static site with no build step. Enable Pages on the `docs/` folder
-and the app is served from `https://<user>.github.io/darts-scoring/`; enter the
-desktop's LAN IP in Settings. Opening the page directly off the desktop server
-(`http://<desktop>:8000/`) needs no configuration at all, and is the easier
-option because browsers only grant camera access on HTTPS or localhost — the
-GitHub Pages copy is HTTPS, so it works, but it must then reach an HTTP LAN
-server, which some browsers block as mixed content. **If the camera or the
-connection misbehaves on the Pages copy, use the desktop-served copy.**
+`docs/` is a static site with no build step. Point Pages at the `docs/` folder
+and it publishes to `https://<user>.github.io/darts-scoring/`.
+
+**Use the desktop-served copy (`https://<desktop>:8000/`) to actually play.**
+It is the same files, and being same-origin it avoids two problems the Pages
+copy has: the browser blocks an HTTPS page from calling a LAN server whose
+self-signed certificate it has not been shown, and CORS then has to be widened
+for an origin that gains nothing. The Pages copy is useful for showing the UI
+without the desktop running.
 
 ## Development
 
 ```bash
 python -m venv .venv && .venv/bin/pip install -r requirements.txt
-.venv/bin/python -m pytest tests/ -q          # 96 tests, no hardware needed
+.venv/bin/python -m pytest tests/ -q          # 109 tests, no hardware needed
 .venv/bin/python -m uvicorn app.main:app --reload --port 8000
 ```
 
@@ -134,7 +165,7 @@ frontend through calibration and live scoring. It needs Playwright:
 
 ```bash
 pip install playwright && playwright install chromium
-python tools/e2e_browser_check.py
+python tools/e2e_browser_check.py            # or pass a base URL
 ```
 
 Debug output for real misreads lands in `data/debug/` — the raw frame, the diff
@@ -148,3 +179,7 @@ mask, an annotated copy and the JSON result for every scored throw.
   recalibration warning.
 - One board, one game, in memory — restarting the server resets the game (but
   not the calibration).
+- The LAN certificate is self-signed, so each phone shows a one-time warning.
+  Service workers are refused on certificate-warning origins, so the app
+  installs to the home screen but does not cache offline; it loads from the
+  desktop each time, which it needs anyway to score.

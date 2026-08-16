@@ -3,5 +3,6 @@ uvicorn[standard]>=0.27
 opencv-python>=4.9
 numpy>=1.26
 httpx>=0.26
+cryptography>=42.0
 pydantic>=2.6
 pytest>=8.0

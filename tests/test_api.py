@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 
-from app import board, config, main
+from app import board, config, detection, main
 from tests import synthetic
 
 
@@ -216,3 +216,62 @@ def test_board_geometry_endpoint_matches_the_scoring_module(calibrated):
     body = client.get("/board").json()
     assert body["segment_order"] == board.SEGMENT_ORDER
     assert body["radii_mm"]["double_outer"] == board.R_DOUBLE_OUTER
+
+
+def test_preview_is_404_until_a_camera_sends_a_frame(client):
+    assert client.get("/preview.jpg").status_code == 404
+
+
+def test_preview_returns_the_latest_annotated_frame(calibrated):
+    client, reference = calibrated
+    x_mm, y_mm = board.point_for_score(20, board.RING_TREBLE)
+    frame = synthetic.add_dart(reference, x_mm, y_mm)
+    client.post("/frame", json={"image": synthetic.encode(frame), "client_id": "phone-1"})
+
+    response = client.get("/preview.jpg")
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "image/jpeg"
+    assert "no-store" in response.headers["cache-control"]
+
+    # It must be a real, decodable image — this is what other screens display.
+    decoded = detection.decode_frame(response.content)
+    assert decoded.shape[1] <= main.PREVIEW_MAX_WIDTH
+
+
+def test_the_first_device_to_send_a_frame_becomes_the_camera(calibrated):
+    client, reference = calibrated
+    client.post("/frame", json={"image": synthetic.encode(reference), "client_id": "phone-1"})
+    camera = client.get("/status").json()["camera"]
+    assert camera["active"] is True
+    assert camera["client_id"] == "phone-1"
+
+
+def test_a_second_device_does_not_steal_an_active_camera(calibrated):
+    client, reference = calibrated
+    client.post("/frame", json={"image": synthetic.encode(reference), "client_id": "phone-1"})
+    client.post("/frame", json={"image": synthetic.encode(reference), "client_id": "desktop-2"})
+    # The desktop's frame is still scored, but the camera role stays with the
+    # phone, so the desktop keeps showing the preview instead of competing.
+    assert client.get("/status").json()["camera"]["client_id"] == "phone-1"
+
+
+def test_the_camera_role_is_released_once_the_device_goes_quiet(calibrated, monkeypatch):
+    client, reference = calibrated
+    client.post("/frame", json={"image": synthetic.encode(reference), "client_id": "phone-1"})
+
+    # Pretend the phone stopped sending frames a while ago.
+    with main.state.lock:
+        main.state.camera_seen_at -= main.CAMERA_ACTIVE_TIMEOUT_S + 5
+    assert client.get("/status").json()["camera"]["active"] is False
+
+    client.post("/frame", json={"image": synthetic.encode(reference), "client_id": "tablet-3"})
+    assert client.get("/status").json()["camera"]["client_id"] == "tablet-3"
+
+
+def test_frames_without_a_client_id_still_score(calibrated):
+    """Older clients, curl, and the API docs must keep working."""
+    client, reference = calibrated
+    x_mm, y_mm = board.point_for_score(20, board.RING_TREBLE)
+    frame = synthetic.add_dart(reference, x_mm, y_mm)
+    body = client.post("/frame", json={"image": synthetic.encode(frame)}).json()
+    assert [d["label"] for d in body["new_darts"]] == ["T20"]

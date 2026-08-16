@@ -11,6 +11,7 @@
     calibrated: false,
     connected: false,
     busy: false,
+    cameraElsewhere: false,
     cooldownUntil: 0,
     lastFrameDataUrl: null,
     manualTarget: null, // dart id when editing, null when adding
@@ -113,9 +114,48 @@
   /* ------------------------------------------------------------------ *
    * Server sync
    * ------------------------------------------------------------------ */
+  /* Exactly one device should hold the camera. Everyone else watches its
+   * frames, so a second screen is a scoreboard rather than a rival sensor. */
+  function renderCameraRole(status) {
+    var info = (status && status.camera) || {};
+    var mine = camera.isRunning();
+    var elsewhere = info.active && info.client_id && info.client_id !== Api.clientId;
+    state.cameraElsewhere = !!elsewhere;
+
+    var role = $('camera-role');
+    var button = $('btn-start-camera');
+    $('video').classList.toggle('hidden', !mine);
+    $('preview').classList.toggle('hidden', mine || !elsewhere);
+
+    if (mine) {
+      role.textContent = 'This device is the camera. Keep it still and pointed at the board.';
+      button.disabled = false;
+      button.textContent = 'Stop camera';
+    } else if (elsewhere) {
+      role.textContent = 'Camera is running on another device — this is the scoreboard. ' +
+        'Detected tips are circled in the live view below.';
+      button.disabled = true;
+      button.textContent = 'Camera on another device';
+    } else {
+      role.textContent = 'No camera running yet. Start one on the phone you have pointed at the board.';
+      button.disabled = false;
+      button.textContent = 'Start camera';
+    }
+  }
+
+  /* Poll the shared frame only while it is actually on screen. */
+  function previewTick() {
+    if (!state.cameraElsewhere) return;
+    if (camera.isRunning()) return;
+    if (!$('view-play').classList.contains('is-active')) return;
+    if (document.hidden) return;
+    $('preview').src = Api.previewUrl();
+  }
+
   function refreshStatus() {
     return Api.status().then(function (status) {
       setConnection(status.needs_recalibration ? 'warn' : 'ok');
+      renderCameraRole(status);
       state.calibrated = status.calibrated;
       renderGame(status.game);
       $('status-dump').textContent = JSON.stringify(status, null, 2);
@@ -288,11 +328,15 @@
       if (camera.isRunning()) {
         camera.stop();
         $('camera-status').textContent = 'off';
+        $('video').classList.add('hidden');
         $('btn-start-camera').textContent = 'Start camera';
+        refreshStatus().catch(function () {});
         return;
       }
       camera.start().then(function () {
         $('camera-status').textContent = 'live';
+        $('video').classList.remove('hidden');
+        $('preview').classList.add('hidden');
         $('btn-start-camera').textContent = 'Stop camera';
         // First frame with a clear board becomes the diff reference.
         return captureAndScore({ setReference: true });
@@ -428,8 +472,16 @@
       showBanner('Cannot reach the server. Check the address in Settings and that start.bat is running.', 'error', 'conn');
     });
 
-    setInterval(function () { refreshStatus().catch(function () {}); }, 10000);
+    // A scoreboard-only device has no local events to react to, so its screen
+    // is only as fresh as this poll — keep it quick. The device holding the
+    // camera already updates itself from every capture, so it polls slowly.
+    (function pollStatus() {
+      refreshStatus().catch(function () {}).finally(function () {
+        setTimeout(pollStatus, state.cameraElsewhere ? 1200 : 5000);
+      });
+    })();
     setInterval(motionTick, 250);
+    setInterval(previewTick, 1000);
   }
 
   document.addEventListener('DOMContentLoaded', init);

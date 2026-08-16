@@ -15,17 +15,22 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+import cv2
 import numpy as np
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import RedirectResponse
+from fastapi.responses import RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from . import board, calibration as calib, config, debug_log, detection, ollama_client
 from .game import GAME_MODES, MODE_COUNT_UP, GameState
 
-APP_VERSION = "0.1.0"
+APP_VERSION = "0.2.0"
+# A camera that has not sent a frame for this long has stopped or wandered off,
+# and another device may take over the role.
+CAMERA_ACTIVE_TIMEOUT_S = 15.0
+PREVIEW_MAX_WIDTH = 640
 FRONTEND_DIR = config.BASE_DIR / "docs"
 
 @asynccontextmanager
@@ -63,6 +68,33 @@ class ServerState:
         self.frames_processed: int = 0
         self.needs_recalibration: bool = False
         self.last_verify: Optional[dict] = None
+        # Latest frame from whichever device is acting as the camera, annotated
+        # with the detections, so other views (the desktop scoreboard) can see
+        # what the camera sees without having a camera of their own.
+        self.preview_jpeg: Optional[bytes] = None
+        self.preview_at: float = 0.0
+        # Which device is the camera. The first one to send a frame claims the
+        # role; others show the preview instead of competing for the board.
+        self.camera_client: Optional[str] = None
+        self.camera_seen_at: float = 0.0
+
+    def camera_status(self, now: Optional[float] = None) -> dict:
+        now = now or time.time()
+        age = now - self.camera_seen_at if self.camera_seen_at else None
+        return {
+            "active": age is not None and age <= CAMERA_ACTIVE_TIMEOUT_S,
+            "client_id": self.camera_client,
+            "age_s": round(age, 1) if age is not None else None,
+            "preview_age_s": round(now - self.preview_at, 1) if self.preview_at else None,
+        }
+
+    def claim_camera(self, client_id: Optional[str]) -> None:
+        """Record who is sending frames, releasing a device that went quiet."""
+        now = time.time()
+        stale = not self.camera_seen_at or (now - self.camera_seen_at) > CAMERA_ACTIVE_TIMEOUT_S
+        if client_id and (stale or self.camera_client in (None, client_id)):
+            self.camera_client = client_id
+        self.camera_seen_at = now
 
 
 state = ServerState()
@@ -74,6 +106,7 @@ state = ServerState()
 class FrameRequest(BaseModel):
     image: str = Field(..., description="JPEG/PNG frame as base64 or a data URL")
     set_reference: bool = Field(False, description="Store this frame as the clear-board reference instead of scoring it")
+    client_id: Optional[str] = Field(None, description="Stable per-device id, so the server knows which device is the camera")
 
 
 class CalibrateRequest(BaseModel):
@@ -88,6 +121,7 @@ class CalibrateRequest(BaseModel):
 
 class NextTurnRequest(BaseModel):
     image: Optional[str] = Field(None, description="Frame of the cleared board to use as the new reference")
+    client_id: Optional[str] = None
 
 
 class VerifyRequest(BaseModel):
@@ -147,9 +181,47 @@ def _resolve_board_point(request: ManualDartRequest) -> tuple[float, float]:
     return board.point_for_score(int(request.segment), ring)
 
 
+def _store_preview(frame: np.ndarray, tips, annotated: Optional[np.ndarray] = None) -> None:
+    """Keep the newest camera frame so other views can watch the board.
+
+    Annotated with the detected tips and the calibrated outline, this doubles as
+    the calibration check: if the outline does not sit on the wire, or crosses
+    land somewhere you did not throw, the homography needs redoing.
+    """
+    try:
+        if annotated is None:
+            outline = (
+                calib.board_outline_image_points(state.calibration, steps=60)
+                if state.calibration
+                else None
+            )
+            annotated = detection.annotate(frame, tips, outline)
+        height, width = annotated.shape[:2]
+        if width > PREVIEW_MAX_WIDTH:
+            scale = PREVIEW_MAX_WIDTH / width
+            annotated = cv2.resize(annotated, (PREVIEW_MAX_WIDTH, int(height * scale)))
+        state.preview_jpeg = detection.encode_jpeg(annotated, quality=70)
+        state.preview_at = time.time()
+    except (cv2.error, ValueError):
+        # A preview is a convenience; never fail a throw over one.
+        pass
+
+
 # --------------------------------------------------------------------------
 # Endpoints
 # --------------------------------------------------------------------------
+@app.get("/preview.jpg", include_in_schema=False)
+def get_preview() -> Response:
+    """The newest annotated camera frame, for views without a camera."""
+    with state.lock:
+        image = state.preview_jpeg
+    if image is None:
+        raise HTTPException(status_code=404, detail="no camera frame received yet")
+    return Response(
+        content=image,
+        media_type="image/jpeg",
+        headers={"Cache-Control": "no-store, max-age=0"},
+    )
 @app.get("/status")
 def get_status() -> dict:
     """Health check — the phone polls this for its connection indicator."""
@@ -165,6 +237,7 @@ def get_status() -> dict:
             "reference_age_s": round(time.time() - state.reference_captured_at, 1) if state.reference_captured_at else None,
             "needs_recalibration": state.needs_recalibration,
             "frames_processed": state.frames_processed,
+            "camera": state.camera_status(),
             "ollama": {
                 "url": config.OLLAMA_URL,
                 "model": config.OLLAMA_MODEL,
@@ -246,9 +319,11 @@ def post_frame(request: FrameRequest) -> dict:
     frame = _decode(request.image)
 
     with state.lock:
+        state.claim_camera(request.client_id)
         if request.set_reference or state.reference_gray is None:
             state.reference_gray = detection.to_gray(frame)
             state.reference_captured_at = time.time()
+            _store_preview(frame, [])
             return {
                 "status": "reference_captured",
                 "new_darts": [],
@@ -279,6 +354,7 @@ def post_frame(request: FrameRequest) -> dict:
                 "changed_fraction": round(changed, 4),
                 "tips": [t.to_dict() for t in tips],
             }
+            _store_preview(frame, tips)
             debug_log.log_detection(frame, mask, None, record)
             return {
                 "status": "scene_changed",
@@ -312,7 +388,8 @@ def post_frame(request: FrameRequest) -> dict:
 
         game_payload = state.game.to_dict()
         outline = calib.board_outline_image_points(state.calibration, steps=60) if state.calibration else None
-        annotated = detection.annotate(frame, tips, outline) if new_darts else None
+        annotated = detection.annotate(frame, tips, outline)
+        _store_preview(frame, tips, annotated=annotated)
         record = {
             "status": "ok",
             "changed_fraction": round(changed, 4),
@@ -320,7 +397,9 @@ def post_frame(request: FrameRequest) -> dict:
             "new_darts": new_darts,
             "game": game_payload,
         }
-        debug_log.log_detection(frame if new_darts else None, mask if new_darts else None, annotated, record)
+        debug_log.log_detection(
+            frame if new_darts else None, mask if new_darts else None, annotated if new_darts else None, record
+        )
 
         return {
             "status": "ok",

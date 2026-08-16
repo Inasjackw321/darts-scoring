@@ -9,6 +9,17 @@
 
   var STORAGE_KEY = 'darts.serverUrl';
   var SETTINGS_KEY = 'darts.settings';
+  var CLIENT_KEY = 'darts.clientId';
+
+  /* A stable id for this device, so the server can tell the phone holding the
+   * camera apart from the desktop watching the scoreboard. */
+  function clientId() {
+    var existing = localStorage.getItem(CLIENT_KEY);
+    if (existing) return existing;
+    var generated = 'dev-' + Math.random().toString(36).slice(2, 10);
+    localStorage.setItem(CLIENT_KEY, generated);
+    return generated;
+  }
 
   var DEFAULT_SETTINGS = {
     mode: 'count_up',
@@ -28,6 +39,12 @@
 
   var Api = {
     baseUrl: normaliseUrl(localStorage.getItem(STORAGE_KEY) || ''),
+    clientId: clientId(),
+
+    previewUrl: function () {
+      // Cache-busted: the point is to always get the newest frame.
+      return this.baseUrl + '/preview.jpg?t=' + Date.now();
+    },
 
     setBaseUrl: function (url) {
       this.baseUrl = normaliseUrl(url);
@@ -87,7 +104,10 @@
     status: function () { return this.request('/status', { timeoutMs: 5000 }); },
     getCalibration: function () { return this.request('/calibration'); },
     calibrate: function (payload) { return this.request('/calibrate', { method: 'POST', body: payload }); },
-    frame: function (payload) { return this.request('/frame', { method: 'POST', body: payload, timeoutMs: 20000 }); },
+    frame: function (payload) {
+      payload.client_id = this.clientId;
+      return this.request('/frame', { method: 'POST', body: payload, timeoutMs: 20000 });
+    },
     verify: function (payload) { return this.request('/verify', { method: 'POST', body: payload, timeoutMs: 120000 }); },
     reset: function (payload) { return this.request('/reset', { method: 'POST', body: payload }); },
     nextTurn: function (payload) { return this.request('/turn/next', { method: 'POST', body: payload || {} }); },

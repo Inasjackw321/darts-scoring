@@ -30,7 +30,13 @@
   Camera.prototype.start = function () {
     var self = this;
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-      return Promise.reject(new Error('This browser cannot access the camera. On iOS the page must be served over HTTPS or from localhost.'));
+      // Browsers only expose the camera in a secure context. Over plain HTTP
+      // from a LAN address the API is not blocked, it is absent — so say what
+      // to do about it rather than reporting a missing feature.
+      var insecure = !window.isSecureContext;
+      return Promise.reject(new Error(insecure
+        ? 'The camera needs a secure connection. Open this page as https://' + location.host + ' instead of http:// — start.bat sets up the certificate.'
+        : 'This browser does not support camera access.'));
     }
     var constraints = {
       audio: false,
