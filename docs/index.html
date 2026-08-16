@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0f1216">
+<title>Dart Scorer</title>
+<link rel="manifest" href="manifest.json">
+<link rel="icon" href="icons/icon-192.png">
+<link rel="apple-touch-icon" href="icons/icon-192.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span id="conn-dot" class="dot dot-red" title="Disconnected"></span>
+    <strong>Dart Scorer</strong>
+  </div>
+  <nav class="tabs">
+    <button class="tab is-active" data-view="play">Play</button>
+    <button class="tab" data-view="calibrate">Calibrate</button>
+    <button class="tab" data-view="settings">Settings</button>
+  </nav>
+</header>
+
+<main>
+  <!-- ================= PLAY ================= -->
+  <section id="view-play" class="view is-active">
+    <div class="scoreboard">
+      <div class="score-main">
+        <div class="label" id="player-name">Player 1</div>
+        <div class="total" id="total-score">0</div>
+        <div class="sub" id="mode-label">Count-up &middot; turn 1</div>
+      </div>
+      <div class="turn-darts" id="turn-darts">
+        <div class="dart-slot empty">1</div>
+        <div class="dart-slot empty">2</div>
+        <div class="dart-slot empty">3</div>
+      </div>
+      <div class="turn-total">Turn: <span id="turn-total">0</span></div>
+    </div>
+
+    <div id="banner-area"></div>
+
+    <div class="panel">
+      <div class="panel-head">
+        <span>Board</span>
+        <span class="muted" id="detect-status">idle</span>
+      </div>
+      <div id="board-diagram" class="board-diagram"></div>
+    </div>
+
+    <div class="controls">
+      <button id="btn-start-camera" class="btn btn-primary">Start camera</button>
+      <button id="btn-next-turn" class="btn">Next turn</button>
+      <button id="btn-undo" class="btn">Undo dart</button>
+      <button id="btn-manual" class="btn">Add manually</button>
+      <button id="btn-verify" class="btn">Verify (AI)</button>
+      <button id="btn-reset" class="btn btn-danger">New game</button>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head"><span>Camera</span><span class="muted" id="camera-status">off</span></div>
+      <video id="video" playsinline muted autoplay></video>
+      <canvas id="capture-canvas" class="hidden"></canvas>
+      <canvas id="motion-canvas" class="hidden"></canvas>
+      <div class="row">
+        <label class="check"><input type="checkbox" id="auto-capture" checked> Auto-capture on motion</label>
+        <span class="muted" id="motion-readout">motion 0%</span>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head"><span>History</span></div>
+      <ol id="history" class="history"></ol>
+    </div>
+  </section>
+
+  <!-- ================= CALIBRATE ================= -->
+  <section id="view-calibrate" class="view">
+    <div class="panel">
+      <p class="help">
+        Point the camera at the board with <strong>no darts in it</strong>, freeze a frame,
+        then tap the four marked points in order. Each one is where a number's centre wire
+        meets the <em>outside</em> edge of the double ring.
+      </p>
+      <ol id="ref-list" class="ref-list"></ol>
+      <div class="controls">
+        <button id="btn-freeze" class="btn btn-primary">Freeze frame</button>
+        <button id="btn-clear-points" class="btn">Clear points</button>
+        <button id="btn-send-calibration" class="btn btn-primary" disabled>Save calibration</button>
+        <button id="btn-show-overlay" class="btn">Check overlay</button>
+      </div>
+      <div class="calib-stage">
+        <canvas id="calib-canvas"></canvas>
+      </div>
+      <p class="muted" id="calib-status">No calibration loaded.</p>
+    </div>
+  </section>
+
+  <!-- ================= SETTINGS ================= -->
+  <section id="view-settings" class="view">
+    <div class="panel">
+      <label class="field">
+        <span>Server address (desktop LAN IP)</span>
+        <input id="server-url" type="url" inputmode="url" placeholder="http://192.168.1.20:8000" autocomplete="off">
+      </label>
+      <div class="controls">
+        <button id="btn-save-server" class="btn btn-primary">Save &amp; test</button>
+        <button id="btn-test" class="btn">Test connection</button>
+      </div>
+      <p class="muted" id="server-status">Not connected.</p>
+    </div>
+
+    <div class="panel">
+      <label class="field">
+        <span>Game mode</span>
+        <select id="game-mode">
+          <option value="count_up">Count-up</option>
+          <option value="x01">501 / x01</option>
+        </select>
+      </label>
+      <label class="field">
+        <span>Starting score (x01 only)</span>
+        <input id="start-score" type="number" value="501" min="101" step="100">
+      </label>
+      <label class="field">
+        <span>Players (one per line)</span>
+        <textarea id="players" rows="3">Player 1</textarea>
+      </label>
+      <label class="field">
+        <span>Motion threshold (% of pixels changed &mdash; one dart is ~0.2&ndash;0.5%)</span>
+        <input id="motion-threshold" type="number" value="0.15" min="0.05" step="0.05">
+      </label>
+      <label class="field">
+        <span>Cooldown after a detected dart (ms)</span>
+        <input id="cooldown-ms" type="number" value="1500" min="0" step="100">
+      </label>
+      <div class="controls">
+        <button id="btn-save-settings" class="btn btn-primary">Save settings</button>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head"><span>Server info</span></div>
+      <pre id="status-dump" class="dump">—</pre>
+    </div>
+  </section>
+</main>
+
+<!-- Manual score entry -->
+<dialog id="manual-dialog">
+  <form method="dialog" class="manual-form">
+    <h3 id="manual-title">Add dart</h3>
+    <div class="segment-grid" id="segment-grid"></div>
+    <div class="ring-row">
+      <label><input type="radio" name="ring" value="inner_single" checked> Single</label>
+      <label><input type="radio" name="ring" value="double"> Double</label>
+      <label><input type="radio" name="ring" value="treble"> Treble</label>
+    </div>
+    <div class="controls">
+      <button value="cancel" class="btn">Cancel</button>
+      <button id="manual-confirm" value="ok" class="btn btn-primary">Confirm</button>
+    </div>
+  </form>
+</dialog>
+
+<script src="js/api.js"></script>
+<script src="js/boardview.js"></script>
+<script src="js/camera.js"></script>
+<script src="js/calibrate.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>
