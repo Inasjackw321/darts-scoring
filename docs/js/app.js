@@ -1,544 +1,422 @@
-/* App controller: wires camera -> server -> scoreboard, plus the manual
- * corrections that make the whole thing usable when detection gets it wrong. */
+/* App controller: keypad in, scoreboard out.
+ *
+ * The engine owns the rules and the stats module owns the numbers; this file
+ * only turns taps into darts and state into DOM. Everything is saved to
+ * localStorage after every dart, because a game interrupted by a phone call
+ * should still be there afterwards.
+ */
 (function () {
   'use strict';
 
   var $ = function (id) { return document.getElementById(id); };
+  var SAVE_KEY = 'darts.game.v2';
 
-  var state = {
-    settings: Api.loadSettings(),
+  var app = {
     game: null,
-    calibrated: false,
-    connected: false,
-    busy: false,
-    cameraElsewhere: false,
-    cooldownUntil: 0,
-    lastFrameDataUrl: null,
-    manualTarget: null, // dart id when editing, null when adding
-    manualSegment: 20
+    multiplier: 1,
+    editing: null,   // index-from-end of the dart being corrected, or null
+    pending: '',
+    pendingTimer: null
   };
 
-  var camera = new Camera($('video'), $('capture-canvas'), $('motion-canvas'));
-  var calibrator = new Calibrator($('calib-canvas'), { onChange: renderCalibrationProgress });
-
   /* ------------------------------------------------------------------ *
-   * Banners
+   * Persistence
    * ------------------------------------------------------------------ */
-  function showBanner(message, kind, key) {
-    var area = $('banner-area');
-    var id = 'banner-' + (key || Math.random().toString(36).slice(2));
-    var existing = document.getElementById(id);
-    if (existing) existing.remove();
-    var node = document.createElement('div');
-    node.id = id;
-    node.className = 'banner banner-' + (kind || 'info');
-    node.textContent = message;
-    area.appendChild(node);
-    if (kind !== 'error') {
-      setTimeout(function () { if (node.parentNode) node.remove(); }, 8000);
-    }
+  function save() {
+    try {
+      localStorage.setItem(SAVE_KEY, JSON.stringify(app.game.toJSON()));
+    } catch (err) { /* private browsing, quota — play on regardless */ }
   }
 
-  function clearBanners() { $('banner-area').innerHTML = ''; }
+  function load() {
+    try {
+      var raw = localStorage.getItem(SAVE_KEY);
+      return raw ? Darts.fromJSON(JSON.parse(raw)) : null;
+    } catch (err) {
+      return null;
+    }
+  }
 
   /* ------------------------------------------------------------------ *
    * Rendering
    * ------------------------------------------------------------------ */
-  function setConnection(status) {
-    state.connected = status === 'ok';
-    var dot = $('conn-dot');
-    dot.className = 'dot ' + (status === 'ok' ? 'dot-green' : status === 'warn' ? 'dot-amber' : 'dot-red');
-    dot.title = status === 'ok' ? 'Connected' : 'Disconnected';
+  function show(view) {
+    ['play', 'stats', 'setup'].forEach(function (name) {
+      $('view-' + name).classList.toggle('is-active', name === view);
+    });
+    if (view === 'stats') renderStats();
+    window.scrollTo(0, 0);
   }
 
-  function renderGame(game) {
-    if (!game) return;
-    state.game = game;
-    $('player-name').textContent = game.current_player;
-    $('total-score').textContent = game.players[game.current_player_index].score;
-    $('mode-label').textContent =
-      (game.mode === 'x01' ? game.start_score + ' / x01' : 'Count-up') + ' · turn ' + game.turn_number;
-    $('turn-total').textContent = game.turn_total;
+  function render() {
+    var state = app.game.state();
+    renderScores(state);
+    renderTurn(state);
+    renderCheckout(state);
+    renderFlash(state);
+    save();
+  }
 
-    var slots = $('turn-darts');
-    slots.innerHTML = '';
-    for (var i = 0; i < 3; i++) {
-      var dart = game.current_turn[i];
+  function renderScores(state) {
+    var host = $('scores');
+    host.className = 'scores ' + (state.players.length === 2 ? 'two' : state.players.length > 2 ? 'many' : '');
+    host.innerHTML = '';
+    state.players.forEach(function (player, index) {
+      var card = document.createElement('div');
+      card.className = 'player' + (index === state.currentPlayerIndex && !state.matchOver ? ' is-live' : '');
+
+      var name = document.createElement('div');
+      name.className = 'name';
+      var who = document.createElement('span');
+      who.textContent = player.name;
+      var legs = document.createElement('span');
+      legs.textContent = state.config.legsToWin > 1
+        ? player.legsWon + '/' + state.config.legsToWin + ' legs' : '';
+      name.appendChild(who);
+      name.appendChild(legs);
+      card.appendChild(name);
+
+      var score = document.createElement('div');
+      score.className = 'score';
+      score.textContent = player.score;
+      card.appendChild(score);
+
+      var meta = document.createElement('div');
+      meta.className = 'legs';
+      var avg = player.dartsThrown ? (player.pointsScored / player.dartsThrown * 3) : 0;
+      meta.textContent = player.dartsThrown
+        ? 'avg ' + avg.toFixed(1) + ' · ' + player.dartsThrown + ' darts'
+        : 'no darts yet';
+      card.appendChild(meta);
+
+      host.appendChild(card);
+    });
+  }
+
+  function renderTurn(state) {
+    var host = $('turn-darts');
+    host.innerHTML = '';
+    var turn = state.currentTurn;
+    for (var i = 0; i < Darts.DARTS_PER_TURN; i++) {
+      var d = turn[i];
       var slot = document.createElement('div');
-      if (dart) {
-        slot.className = 'dart-slot' + (dart.low_confidence ? ' low-confidence' : '') + (dart.source === 'manual' ? ' manual' : '');
-        slot.innerHTML = dart.label + '<small>' + dart.points + ' pts · tap to fix</small>';
-        slot.dataset.dartId = dart.id;
-        slot.addEventListener('click', onEditDart);
+      if (d) {
+        var indexFromEnd = turn.length - 1 - i;
+        slot.className = 'slot filled' + (app.editing === indexFromEnd ? ' editing' : '');
+        slot.textContent = Darts.label(d);
+        slot.title = 'Tap to correct this dart';
+        (function (target) {
+          slot.addEventListener('click', function () { beginEdit(target); });
+        })(indexFromEnd);
       } else {
-        slot.className = 'dart-slot empty';
-        slot.textContent = String(i + 1);
+        slot.className = 'slot empty';
+        slot.textContent = '·';
       }
-      slots.appendChild(slot);
+      host.appendChild(slot);
     }
-
-    BoardView.render($('board-diagram'), game.current_turn);
-
-    var history = $('history');
-    history.innerHTML = '';
-    game.players.forEach(function (player) {
-      player.turns.slice(-8).forEach(function (turn, index) {
-        var total = turn.reduce(function (sum, d) { return sum + d.points; }, 0);
-        var item = document.createElement('li');
-        item.innerHTML = '<span>' + player.name + ' · ' +
-          (turn.map(function (d) { return d.label; }).join(', ') || '—') + '</span><strong>' + total + '</strong>';
-        history.appendChild(item);
-        void index;
-      });
-    });
-
-    if (game.winner) showBanner(game.winner + ' wins!', 'info', 'winner');
-    if (game.bust) showBanner('Bust — turn over, score reverted.', 'warn', 'bust');
-    (game.warnings || []).forEach(function (w) { showBanner(w, 'warn'); });
+    $('turn-total').textContent = turn.reduce(function (sum, d) { return sum + Darts.points(d); }, 0);
   }
 
-  function renderCalibrationProgress() {
-    var list = $('ref-list');
-    var points = calibrator.referencePoints || [];
-    list.innerHTML = '';
-    points.forEach(function (point, index) {
-      var item = document.createElement('li');
-      item.textContent = point.name;
-      if (index < calibrator.points.length) item.className = 'done';
-      else if (index === calibrator.points.length) item.className = 'next';
-      list.appendChild(item);
-    });
-    $('btn-send-calibration').disabled = !calibrator.isComplete();
+  function renderCheckout(state) {
+    var hint = $('checkout-hint');
+    if (state.matchOver || state.config.mode !== Darts.MODE_X01) { hint.textContent = ''; return; }
+    var player = state.players[state.currentPlayerIndex];
+    var dartsLeft = Darts.DARTS_PER_TURN - state.currentTurn.length;
+    var route = Darts.checkout(player.score, dartsLeft);
+    hint.textContent = route
+      ? 'Checkout: ' + route.map(Darts.label).join(' · ')
+      : (player.score <= 170 ? 'No checkout from ' + player.score : '');
+  }
+
+  function renderFlash(state) {
+    var flash = $('flash');
+    flash.className = 'flash' + (state.matchOver ? ' win' : '');
+    flash.textContent = app.editing !== null
+      ? 'Correcting a dart — tap its real score.'
+      : (state.message || '');
   }
 
   /* ------------------------------------------------------------------ *
-   * Server sync
+   * Input
    * ------------------------------------------------------------------ */
-  /* Exactly one device should hold the camera. Everyone else watches its
-   * frames, so a second screen is a scoreboard rather than a rival sensor. */
-  function renderCameraRole(status) {
-    var info = (status && status.camera) || {};
-    var mine = camera.isRunning();
-    var elsewhere = info.active && info.client_id && info.client_id !== Api.clientId;
-    var server = !!(status && status.capture && status.capture.connected);
-    state.cameraElsewhere = !!(elsewhere || server);
+  function setMultiplier(value) {
+    app.multiplier = value;
+    Array.prototype.forEach.call(document.querySelectorAll('.mult'), function (button) {
+      var on = Number(button.dataset.mult) === value;
+      button.classList.toggle('is-on', on);
+      button.setAttribute('aria-pressed', on ? 'true' : 'false');
+    });
+  }
 
-    var role = $('camera-role');
-    var button = $('btn-start-camera');
-    $('video').classList.toggle('hidden', !mine);
-    $('preview').classList.toggle('hidden', mine || !(elsewhere || server));
+  function beginEdit(indexFromEnd) {
+    app.editing = indexFromEnd;
+    render();
+  }
 
-    if (mine) {
-      role.textContent = 'This device is the camera. Keep it still and pointed at the board.';
-      button.disabled = false;
-      button.textContent = 'Stop camera';
-    } else if (server) {
-      role.textContent = 'The desktop is reading the camera directly. This screen is a scoreboard — ' +
-        'the live view below is what the camera sees, with detected tips circled.';
-      button.disabled = true;
-      button.textContent = 'Desktop is the camera';
-    } else if (elsewhere) {
-      role.textContent = 'Camera is running on another device — this is the scoreboard. ' +
-        'Detected tips are circled in the live view below.';
-      button.disabled = true;
-      button.textContent = 'Camera on another device';
+  function submit(d) {
+    if (app.editing !== null) {
+      app.game.editDart(app.editing, d);
+      app.editing = null;
     } else {
-      role.textContent = 'No camera running yet. Start one on the phone you have pointed at the board.';
-      button.disabled = false;
-      button.textContent = 'Start camera';
+      app.game.throwDart(d);
     }
+    // A multiplier applies to one dart, then reverts — leaving "treble" on by
+    // accident is the easiest way to record a wrong score.
+    setMultiplier(1);
+    render();
   }
 
-  function renderCapture(status) {
-    var info = (status && status.capture) || {};
-    var label = $('capture-state');
-    var detail = $('capture-detail');
-    if (!info.running) {
-      label.textContent = 'off';
-      detail.textContent = info.error || 'Not running.';
-      return;
+  function buildKeypad() {
+    var host = $('numbers');
+    host.innerHTML = '';
+    // Numeric order, not board order: you are looking up a number you already
+    // know, not reading it off the board.
+    for (var n = 1; n <= 20; n++) {
+      var key = document.createElement('button');
+      key.className = 'key';
+      key.type = 'button';
+      key.textContent = n;
+      key.dataset.number = n;
+      host.appendChild(key);
     }
-    if (!info.connected) {
-      label.textContent = 'connecting';
-      detail.textContent = info.error || 'Opening ' + info.source + '…';
-      return;
-    }
-    label.textContent = 'live';
-    detail.textContent = 'Reading ' + info.source + ' · ' + info.frames_read +
-      ' frames · last motion ' + info.last_motion_pct + '%';
+    host.addEventListener('click', function (event) {
+      var button = event.target.closest('.key');
+      if (button) submit(Darts.dart(Number(button.dataset.number), app.multiplier));
+    });
+
+    document.querySelector('.specials').addEventListener('click', function (event) {
+      var button = event.target.closest('.key');
+      if (!button) return;
+      var kind = button.dataset.special;
+      if (kind === 'miss') submit(Darts.MISS);
+      else if (kind === 'bull') submit(Darts.BULL);
+      else submit(Darts.OUTER_BULL);
+    });
+
+    document.querySelector('.mult-row').addEventListener('click', function (event) {
+      var button = event.target.closest('.mult');
+      if (!button) return;
+      var value = Number(button.dataset.mult);
+      setMultiplier(app.multiplier === value ? 1 : value);
+    });
   }
 
-  /* Poll the shared frame only while it is actually on screen. */
-  function previewTick() {
-    if (!state.cameraElsewhere) return;
-    if (camera.isRunning()) return;
-    if (!$('view-play').classList.contains('is-active')) return;
-    if (document.hidden) return;
-    $('preview').src = Api.previewUrl();
+  /* ------------------------------------------------------------------ *
+   * Stats
+   * ------------------------------------------------------------------ */
+  function fmt(value, digits) {
+    return Number(value).toFixed(digits === undefined ? 1 : digits);
   }
 
-  function refreshStatus() {
-    return Api.status().then(function (status) {
-      setConnection(status.needs_recalibration ? 'warn' : 'ok');
-      renderCameraRole(status);
-      renderCapture(status);
-      state.calibrated = status.calibrated;
-      renderGame(status.game);
-      $('status-dump').textContent = JSON.stringify(status, null, 2);
-      $('server-status').textContent = 'Connected to ' + Api.baseUrl +
-        ' · calibrated: ' + status.calibrated + ' · Ollama: ' + (status.ollama.available ? status.ollama.model : 'offline');
-      $('calib-status').textContent = status.calibrated
-        ? 'Calibrated (fit error ' + status.calibration_rms_error_mm + ' mm).'
-        : 'Not calibrated — the server cannot score until this is done.';
-      if (status.needs_recalibration) {
-        showBanner('The camera looks like it moved. Recalibrate before trusting scores.', 'warn', 'recal');
+  function tile(key, value, note) {
+    var node = document.createElement('div');
+    node.className = 'tile';
+    ['k', 'v', 'w'].forEach(function (cls, index) {
+      var part = document.createElement('div');
+      part.className = cls;
+      part.textContent = [key, value, note || ''][index];
+      node.appendChild(part);
+    });
+    return node;
+  }
+
+  function th(text) {
+    var cell = document.createElement('th');
+    cell.textContent = text;
+    return cell;
+  }
+
+  function renderStats() {
+    var state = app.game.state();
+    var stats = DartsStats.compute(state);
+    var isX01 = state.config.mode === Darts.MODE_X01;
+
+    // Headline tiles: the leader's numbers, since that is what gets read first.
+    var summary = $('stats-summary');
+    summary.innerHTML = '';
+    var best = stats.players.slice().sort(function (a, b) {
+      return b.threeDartAverage - a.threeDartAverage;
+    })[0];
+    if (best) {
+      summary.appendChild(tile('Best average', fmt(best.threeDartAverage), best.name));
+      summary.appendChild(tile('Darts thrown', stats.totalDarts, 'across the match'));
+      summary.appendChild(tile('Highest turn', best.bestTurn, best.name));
+      if (isX01) {
+        summary.appendChild(tile('Checkout', fmt(best.checkoutPercent, 0) + '%',
+          best.checkoutsHit + ' of ' + best.checkoutAttempts + ' chances'));
       }
-      return status;
-    }).catch(function (err) {
-      setConnection('down');
-      $('server-status').textContent = err.message;
-      throw err;
-    });
-  }
-
-  /* ------------------------------------------------------------------ *
-   * Capture loop
-   * ------------------------------------------------------------------ */
-  function captureAndScore(options) {
-    options = options || {};
-    if (state.busy) return Promise.resolve();
-    var dataUrl = camera.capture();
-    if (!dataUrl) return Promise.resolve();
-    state.lastFrameDataUrl = dataUrl;
-    state.busy = true;
-    $('detect-status').textContent = options.setReference ? 'capturing reference…' : 'scoring…';
-
-    return Api.frame({ image: dataUrl, set_reference: !!options.setReference })
-      .then(function (result) {
-        setConnection(result.needs_recalibration ? 'warn' : 'ok');
-        if (result.status === 'reference_captured') {
-          $('detect-status').textContent = 'reference captured';
-          showBanner('Clear-board reference captured — throw away.', 'info', 'ref');
-        } else if (result.status === 'scene_changed') {
-          $('detect-status').textContent = 'scene changed';
-        } else {
-          $('detect-status').textContent = result.new_darts.length
-            ? 'scored ' + result.new_darts.map(function (d) { return d.label; }).join(', ')
-            : 'no new darts';
-        }
-        (result.warnings || []).forEach(function (w) { showBanner(w, 'warn'); });
-        renderGame(result.game);
-        if (result.new_darts && result.new_darts.length) {
-          // Cooldown stops the same dart re-triggering while the board settles.
-          state.cooldownUntil = Date.now() + Number(state.settings.cooldownMs || 0);
-        }
-        return result;
-      })
-      .catch(function (err) {
-        if (err.status === 409) {
-          showBanner('Server is not calibrated yet — open the Calibrate tab.', 'error', 'nocal');
-        } else {
-          setConnection('down');
-          showBanner(err.message, 'error', 'frame-error');
-        }
-      })
-      .finally(function () {
-        camera.resetMotion();
-        state.busy = false;
-      });
-  }
-
-  function motionTick() {
-    if (!camera.isRunning()) return;
-    var level = camera.motionLevel();
-    $('motion-readout').textContent = 'motion ' + (level * 100).toFixed(1) + '%';
-    if (!$('auto-capture').checked) return;
-    if (Date.now() < state.cooldownUntil) return;
-    if (state.busy) return;
-    if (level * 100 >= Number(state.settings.motionThreshold || 2)) {
-      // Wait a beat so the frame we send is of a settled dart, not a blur.
-      state.busy = true;
-      setTimeout(function () { state.busy = false; captureAndScore(); }, 350);
     }
+
+    // The table is the accessible view of everything the charts show.
+    var rows = [
+      ['3-dart average', function (p) { return fmt(p.threeDartAverage); }],
+      ['First 9 average', function (p) { return fmt(p.firstNineAverage); }],
+      ['Darts thrown', function (p) { return p.dartsThrown; }],
+      ['Points scored', function (p) { return p.pointsScored; }],
+      ['Best turn', function (p) { return p.bestTurn; }],
+      ['180s', function (p) { return p.bands['180']; }],
+      ['140+', function (p) { return p.bands['140+']; }],
+      ['100+', function (p) { return p.bands['100+']; }],
+      ['60+', function (p) { return p.bands['60+']; }]
+    ];
+    if (isX01) {
+      rows = rows.concat([
+        ['Legs won', function (p) { return p.legsWon; }],
+        ['Checkouts', function (p) { return p.checkoutsHit + ' / ' + p.checkoutAttempts; }],
+        ['Checkout %', function (p) { return fmt(p.checkoutPercent, 0) + '%'; }],
+        ['Highest checkout', function (p) { return p.highestCheckout || '—'; }],
+        ['Darts at a double', function (p) { return p.doublesHit + ' / ' + p.doubleAttempts; }],
+        ['Busts', function (p) { return p.busts; }]
+      ]);
+    }
+
+    var table = $('stats-table');
+    table.innerHTML = '';
+    var head = table.createTHead().insertRow();
+    head.appendChild(th(''));
+    stats.players.forEach(function (p, index) {
+      var cell = th('');
+      // The swatch ties each column to its line on the chart.
+      var swatch = document.createElement('span');
+      swatch.className = 'legend-swatch';
+      swatch.style.background = DartsCharts.seriesColour(index);
+      cell.appendChild(swatch);
+      cell.appendChild(document.createTextNode(' ' + p.name));
+      head.appendChild(cell);
+    });
+    var body = table.createTBody();
+    rows.forEach(function (row) {
+      var tr = body.insertRow();
+      tr.insertCell().textContent = row[0];
+      stats.players.forEach(function (p) {
+        tr.insertCell().textContent = row[1](p);
+      });
+    });
+
+    // Charts show the most recent leg that has any turns in it.
+    var legs = stats.progression;
+    var leg = legs[legs.length - 1];
+    $('progression-caption').textContent = leg
+      ? (isX01 ? 'Score remaining after each turn — leg ' + leg.leg : 'Running total after each turn')
+      : 'Nothing played yet.';
+    DartsCharts.progression($('chart-progression'), leg);
+    DartsCharts.boardHeatmap($('chart-board'), stats.board);
+    renderBoardTable(stats.board);
+  }
+
+  function renderBoardTable(board) {
+    var table = $('board-table');
+    table.innerHTML = '';
+    var entries = Object.keys(board.cells).map(function (key) {
+      var parts = key.split(':');
+      return {
+        label: Darts.label(Darts.dart(Number(parts[0]), Number(parts[1]))),
+        count: board.cells[key]
+      };
+    }).sort(function (a, b) { return b.count - a.count; }).slice(0, 8);
+
+    if (board.misses) entries.push({ label: 'Miss', count: board.misses });
+    if (!entries.length) return;
+
+    var head = table.createTHead().insertRow();
+    head.appendChild(th('Most hit'));
+    head.appendChild(th('Darts'));
+    var body = table.createTBody();
+    entries.forEach(function (entry) {
+      var tr = body.insertRow();
+      tr.insertCell().textContent = entry.label;
+      tr.insertCell().textContent = entry.count;
+    });
   }
 
   /* ------------------------------------------------------------------ *
-   * Manual entry
+   * Setup
    * ------------------------------------------------------------------ */
-  function buildSegmentGrid() {
-    var grid = $('segment-grid');
-    grid.innerHTML = '';
-    BoardView.order.slice().sort(function (a, b) { return a - b; }).concat([25, 0]).forEach(function (segment) {
-      var button = document.createElement('button');
-      button.type = 'button';
-      button.textContent = segment === 25 ? 'BULL' : segment === 0 ? 'MISS' : segment;
-      button.dataset.segment = segment;
-      if (segment === state.manualSegment) button.classList.add('selected');
-      button.addEventListener('click', function () {
-        state.manualSegment = segment;
-        Array.prototype.forEach.call(grid.children, function (child) { child.classList.remove('selected'); });
-        button.classList.add('selected');
-      });
-      grid.appendChild(button);
-    });
+  function readSetup() {
+    var chosen = document.querySelector('#setup-mode .chip.is-on');
+    var countUp = chosen && chosen.dataset.countup;
+    return {
+      mode: countUp ? Darts.MODE_COUNT_UP : Darts.MODE_X01,
+      startScore: Number((chosen && chosen.dataset.start) || 501),
+      // Four is the cap: past that the chart would need a fifth categorical
+      // hue, and the palette deliberately does not have one.
+      players: $('setup-players').value.split('\n')
+        .map(function (s) { return s.trim(); })
+        .filter(Boolean)
+        .slice(0, 4),
+      legsToWin: Math.max(1, Number($('setup-legs').value) || 1),
+      doubleOut: $('setup-double-out').checked,
+      doubleIn: $('setup-double-in').checked
+    };
   }
 
-  function ringValue() {
-    var checked = document.querySelector('input[name="ring"]:checked');
-    return checked ? checked.value : 'inner_single';
+  function startGame(options) {
+    app.game = Darts.createGame(options);
+    app.editing = null;
+    setMultiplier(1);
+    render();
+    show('play');
   }
 
-  function openManualDialog(dartId) {
-    state.manualTarget = dartId || null;
-    $('manual-title').textContent = dartId ? 'Correct dart' : 'Add dart';
-    buildSegmentGrid();
-    $('manual-dialog').showModal();
-  }
-
-  function onEditDart(event) {
-    openManualDialog(event.currentTarget.dataset.dartId);
-  }
-
-  function submitManual() {
-    var segment = state.manualSegment;
-    var ring = segment === 25 ? 'inner_bull' : segment === 0 ? 'miss' : ringValue();
-    var payload = { segment: segment, ring: ring };
-    if (segment === 0) { payload = { x_mm: 0, y_mm: 250 }; } // guaranteed off-board => MISS
-    var call = state.manualTarget
-      ? Api.editDart(Object.assign({ dart_id: state.manualTarget }, payload))
-      : Api.addDart(payload);
-    call.then(function (result) {
-      renderGame(result.game);
-    }).catch(function (err) {
-      showBanner(err.message, 'error');
-    });
-  }
-
-  /* ------------------------------------------------------------------ *
-   * Wiring
-   * ------------------------------------------------------------------ */
-  function bindTabs() {
-    Array.prototype.forEach.call(document.querySelectorAll('.tab'), function (tab) {
-      tab.addEventListener('click', function () {
-        Array.prototype.forEach.call(document.querySelectorAll('.tab'), function (t) { t.classList.remove('is-active'); });
-        Array.prototype.forEach.call(document.querySelectorAll('.view'), function (v) { v.classList.remove('is-active'); });
-        tab.classList.add('is-active');
-        $('view-' + tab.dataset.view).classList.add('is-active');
-      });
-    });
-  }
-
-  function loadSettingsIntoForm() {
-    var settings = state.settings;
-    $('server-url').value = Api.baseUrl;
-    $('game-mode').value = settings.mode;
-    $('start-score').value = settings.startScore;
-    $('players').value = settings.players.join('\n');
-    $('motion-threshold').value = settings.motionThreshold;
-    $('cooldown-ms').value = settings.cooldownMs;
-    $('video-source').value = settings.videoSource || '';
-  }
-
-  function saveSettingsFromForm() {
-    state.settings = Api.saveSettings({
-      mode: $('game-mode').value,
-      startScore: Number($('start-score').value) || 501,
-      players: $('players').value.split('\n').map(function (s) { return s.trim(); }).filter(Boolean),
-      motionThreshold: Number($('motion-threshold').value) || 0.15,
-      cooldownMs: Number($('cooldown-ms').value) || 0,
-      videoSource: $('video-source').value.trim()
-    });
-    showBanner('Settings saved.', 'info', 'settings');
-  }
-
-  function bindControls() {
-    $('btn-start-camera').addEventListener('click', function () {
-      if (camera.isRunning()) {
-        camera.stop();
-        $('camera-status').textContent = 'off';
-        $('video').classList.add('hidden');
-        $('btn-start-camera').textContent = 'Start camera';
-        refreshStatus().catch(function () {});
-        return;
-      }
-      camera.start().then(function () {
-        $('camera-status').textContent = 'live';
-        $('video').classList.remove('hidden');
-        $('preview').classList.add('hidden');
-        $('btn-start-camera').textContent = 'Stop camera';
-        // First frame with a clear board becomes the diff reference.
-        return captureAndScore({ setReference: true });
-      }).catch(function (err) {
-        showBanner(err.message, 'error', 'camera');
-        $('camera-status').textContent = 'error';
-      });
-    });
-
-    $('btn-next-turn').addEventListener('click', function () {
-      var image = camera.isRunning() ? camera.capture() : null;
-      Api.nextTurn(image ? { image: image } : {})
-        .then(function (result) {
-          renderGame(result.game);
-          camera.resetMotion();
-          showBanner('Next turn — pull the darts out, the board reference resets.', 'info', 'turn');
-        })
-        .catch(function (err) { showBanner(err.message, 'error'); });
-    });
-
+  function bind() {
     $('btn-undo').addEventListener('click', function () {
-      Api.undoDart()
-        .then(function (result) { renderGame(result.game); })
-        .catch(function (err) { showBanner(err.message, 'error'); });
+      app.editing = null;
+      app.game.undo();
+      render();
+    });
+    $('btn-stats').addEventListener('click', function () { show('stats'); });
+    $('btn-close-stats').addEventListener('click', function () { show('play'); });
+    $('btn-setup').addEventListener('click', function () {
+      $('setup-players').value = app.game.config.players.join('\n');
+      $('setup-legs').value = app.game.config.legsToWin;
+      show('setup');
+    });
+    $('btn-close-setup').addEventListener('click', function () { show('play'); });
+    $('btn-start').addEventListener('click', function () { startGame(readSetup()); });
+
+    $('setup-mode').addEventListener('click', function (event) {
+      var chip = event.target.closest('.chip');
+      if (!chip) return;
+      Array.prototype.forEach.call(this.children, function (c) { c.classList.remove('is-on'); });
+      chip.classList.add('is-on');
     });
 
-    $('btn-manual').addEventListener('click', function () { openManualDialog(null); });
+    // A keyboard is quicker than tapping when one is to hand.
+    document.addEventListener('keydown', function (event) {
+      if (!$('view-play').classList.contains('is-active')) return;
+      if (event.target.tagName === 'INPUT' || event.target.tagName === 'TEXTAREA') return;
 
-    $('manual-dialog').addEventListener('close', function () {
-      if ($('manual-dialog').returnValue === 'ok') submitManual();
-    });
-
-    $('btn-verify').addEventListener('click', function () {
-      var image = state.lastFrameDataUrl || (camera.isRunning() ? camera.capture() : null);
-      if (!image) { showBanner('Start the camera first.', 'warn'); return; }
-      showBanner('Asking the vision model… this takes a few seconds.', 'info', 'verify');
-      Api.verify({ image: image }).then(function (result) {
-        if (!result.verify.available) {
-          showBanner('Verification unavailable: ' + result.verify.error, 'error', 'verify');
-          return;
-        }
-        if (result.warnings.length) {
-          result.warnings.forEach(function (w) { showBanner(w, 'warn'); });
-        } else {
-          showBanner('Vision check agrees: ' + result.verify.dart_count + ' dart(s).', 'info', 'verify');
-        }
-      }).catch(function (err) { showBanner(err.message, 'error', 'verify'); });
-    });
-
-    $('btn-reset').addEventListener('click', function () {
-      var image = camera.isRunning() ? camera.capture() : null;
-      Api.reset({
-        mode: state.settings.mode,
-        players: state.settings.players,
-        start_score: state.settings.startScore,
-        image: image
-      }).then(function (result) {
-        clearBanners();
-        renderGame(result.game);
-        camera.resetMotion();
-        showBanner('New game started.', 'info', 'newgame');
-      }).catch(function (err) { showBanner(err.message, 'error'); });
-    });
-
-    $('btn-save-server').addEventListener('click', function () {
-      Api.setBaseUrl($('server-url').value);
-      $('server-url').value = Api.baseUrl;
-      refreshStatus().catch(function () {});
-    });
-    $('btn-test').addEventListener('click', function () { refreshStatus().catch(function () {}); });
-    $('btn-save-settings').addEventListener('click', saveSettingsFromForm);
-
-    $('btn-capture-start').addEventListener('click', function () {
-      var source = $('video-source').value.trim();
-      if (!source) {
-        showBanner('Enter the stream URL from your phone\'s webcam app, or 0 for a USB camera.', 'warn');
-        return;
+      if (event.key === 'd') setMultiplier(app.multiplier === 2 ? 1 : 2);
+      else if (event.key === 't') setMultiplier(app.multiplier === 3 ? 1 : 3);
+      else if (event.key === 'b') submit(Darts.BULL);
+      else if (event.key === 'm') submit(Darts.MISS);
+      else if (event.key === 'Backspace') { event.preventDefault(); app.game.undo(); render(); }
+      else if (/^\d$/.test(event.key)) {
+        // Two-digit numbers need a beat: "1" then "2" means 12, not 1 then 2.
+        var next = (app.pending || '') + event.key;
+        if (Number(next) > 20) next = event.key;
+        app.pending = next;
+        clearTimeout(app.pendingTimer);
+        app.pendingTimer = setTimeout(function () {
+          var n = Number(app.pending);
+          app.pending = '';
+          if (n === 0) submit(Darts.MISS);
+          else if (n >= 1 && n <= 20) submit(Darts.dart(n, app.multiplier));
+        }, 350);
       }
-      state.settings.videoSource = source;
-      Api.saveSettings(state.settings);
-      $('capture-detail').textContent = 'Opening ' + source + '…';
-      Api.startCapture(source).then(function (result) {
-        renderCapture({ capture: result.capture });
-        if (result.ok) {
-          showBanner('Camera connected. The desktop is now doing the capturing.', 'info', 'capture');
-        } else {
-          showBanner('Could not open ' + source + '. ' + (result.capture.error || '') +
-            ' Check the app is streaming and the address is right.', 'error', 'capture');
-        }
-        return refreshStatus();
-      }).catch(function (err) { showBanner(err.message, 'error', 'capture'); });
     });
-
-    $('btn-capture-stop').addEventListener('click', function () {
-      Api.stopCapture().then(function (result) {
-        renderCapture({ capture: result.capture });
-        showBanner('Capture stopped.', 'info', 'capture');
-        return refreshStatus();
-      }).catch(function (err) { showBanner(err.message, 'error', 'capture'); });
-    });
-
-    $('btn-freeze').addEventListener('click', function () {
-      var take = camera.isRunning() ? Promise.resolve() : camera.start().then(function () {
-        $('camera-status').textContent = 'live';
-        $('btn-start-camera').textContent = 'Stop camera';
-      });
-      take.then(function () {
-        var dataUrl = camera.capture(1280, 0.9);
-        if (!dataUrl) throw new Error('Camera has not produced a frame yet.');
-        return calibrator.setFrame(dataUrl);
-      }).catch(function (err) { showBanner(err.message, 'error', 'freeze'); });
-    });
-
-    $('btn-clear-points').addEventListener('click', function () { calibrator.clearPoints(); });
-
-    $('btn-send-calibration').addEventListener('click', function () {
-      Api.calibrate(calibrator.payload()).then(function (result) {
-        state.calibrated = true;
-        calibrator.setOverlay(result.board_outline_px);
-        $('calib-status').textContent = 'Saved. Fit error ' + result.rms_error_mm +
-          ' mm — the green outline should sit on the outer wire.';
-        showBanner('Calibration saved.', 'info', 'cal');
-        return refreshStatus();
-      }).catch(function (err) { showBanner(err.message, 'error', 'cal'); });
-    });
-
-    $('btn-show-overlay').addEventListener('click', function () {
-      Api.getCalibration().then(function (result) {
-        if (!result.calibrated) { showBanner('No calibration stored yet.', 'warn'); return; }
-        calibrator.setOverlay(result.board_outline_px);
-      }).catch(function (err) { showBanner(err.message, 'error'); });
-    });
-  }
-
-  function registerServiceWorker() {
-    if (!('serviceWorker' in navigator)) return;
-    // Resolved relative to this script so it works under a GitHub Pages subpath.
-    navigator.serviceWorker.register('sw.js').catch(function () { /* offline shell is optional */ });
   }
 
   function init() {
-    bindTabs();
-    bindControls();
-    loadSettingsIntoForm();
-    registerServiceWorker();
+    buildKeypad();
+    bind();
+    app.game = load() || Darts.createGame({ players: ['Player 1'] });
+    setMultiplier(1);
+    render();
 
-    // Default to the origin we were served from, which is right when the page
-    // is opened straight off the desktop server.
-    if (!Api.baseUrl && location.protocol.startsWith('http') && !/github\.io$/.test(location.hostname)) {
-      Api.setBaseUrl(location.origin);
-      $('server-url').value = Api.baseUrl;
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.register('sw.js').catch(function () { /* offline cache is a bonus */ });
     }
-
-    calibrator.setReferencePoints([]);
-    Api.getCalibration().then(function (result) {
-      calibrator.setReferencePoints(result.reference_points || []);
-      renderCalibrationProgress();
-      if (result.calibrated && result.board_outline_px) calibrator.setOverlay(result.board_outline_px);
-    }).catch(function () { renderCalibrationProgress(); });
-
-    refreshStatus().catch(function () {
-      showBanner('Cannot reach the server. Check the address in Settings and that start.bat is running.', 'error', 'conn');
-    });
-
-    // A scoreboard-only device has no local events to react to, so its screen
-    // is only as fresh as this poll — keep it quick. The device holding the
-    // camera already updates itself from every capture, so it polls slowly.
-    (function pollStatus() {
-      refreshStatus().catch(function () {}).finally(function () {
-        setTimeout(pollStatus, state.cameraElsewhere ? 1200 : 5000);
-      });
-    })();
-    setInterval(motionTick, 250);
-    setInterval(previewTick, 1000);
   }
 
   document.addEventListener('DOMContentLoaded', init);

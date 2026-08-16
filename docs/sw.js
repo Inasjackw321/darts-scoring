@@ -1,16 +1,15 @@
 /* Service worker: caches the static shell so the app opens instantly from the
  * home screen. API calls are never cached — a stale score is worse than none,
  * and the server is on the LAN anyway. */
-var CACHE = 'darts-shell-v1';
+var CACHE = 'darts-shell-v3';
 var SHELL = [
   './',
   './index.html',
   './styles.css',
   './manifest.json',
-  './js/api.js',
-  './js/boardview.js',
-  './js/camera.js',
-  './js/calibrate.js',
+  './js/engine.js',
+  './js/stats.js',
+  './js/charts.js',
   './js/app.js',
   './icons/icon-192.png',
   './icons/icon-512.png'
